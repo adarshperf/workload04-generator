@@ -1,0 +1,6 @@
+# Development/test-only dependencies for workload04_generator.
+#
+# Only required to run `python workload04_generator.py self-test`
+# (tests/test_regression.py, executed via pytest). Not required for normal
+# generation/validation/audit use.
+pytest>=7.0

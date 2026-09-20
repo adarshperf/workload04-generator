@@ -1,0 +1,18 @@
+# Runtime dependencies for workload04_generator.
+#
+# The generator itself (wg/, workload04_generator.py) uses ONLY the Python
+# standard library -- no hard runtime dependency exists for the strict 1:1
+# generation model, path normalization, storage pre-flight, atomic staging,
+# or validation/audit logic.
+#
+# The packages below are used by the vendored `wmime/formats.py` module for
+# higher-fidelity, format-aware content generation (real JPEG/PNG re-encode,
+# real PDF object edits, real PE/EXE section resize). Every import is
+# try/except-guarded in formats.py: if a package below is missing, that
+# family's generator falls back to a generic, still size-correct,
+# still-validating "binary_fallback" content path instead of failing.
+# Install these for maximum content-fidelity; they are NOT required for the
+# tool to run, generate, validate, or pass self-test.
+Pillow>=10.0
+pypdf>=4.0
+pefile>=2023.2.7 ; sys_platform == "win32" or sys_platform == "linux"

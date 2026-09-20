@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test/cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime/generated output
+generated_workload04/
+output/
+tmp/
+temp/
+
+# Generated reference workload payload trees
+reference_workloads/workload04-100KiB/
+reference_workloads/workload04-1MiB/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local logs/reports
+*.log
+
+# Local temporary files
+*.tmp
+
+# Temporary test-generated baseline snapshots
+baselines/test_*/
