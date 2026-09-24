@@ -118,3 +118,47 @@ def rescale_plan_sizes(plan: WorkloadPlan, factor: float) -> None:
             r.source_size_bytes, plan.scale_factor, r.is_av_test, plan.max_single_file_bytes,
         )
 
+
+# Families whose format generators (see wmime/formats.py) never shrink a
+# real seed below its own byte size -- doing so would either destroy the
+# format's required structure (HTML/CSS/JS/XML: mid-tag truncation; PDF/PE:
+# broken headers/xrefs/checksums) or (ZIP) requires dropping real archive
+# members, which the generator refuses to do silently. Used to compute a
+# PROVABLE LOWER BOUND on the achievable request-weighted average for a
+# plan -- NOT the exact achievable minimum: other families (jpeg/gif/png/
+# wav) have their own content-dependent re-encode/resize floors that are
+# not captured here, so the true minimum may be higher than this bound.
+HARD_NO_SHRINK_FAMILIES = frozenset({"html", "css", "js", "xml", "pdf", "pe", "zip"})
+
+
+def compute_hard_floor(plan: WorkloadPlan) -> dict:
+    """Lower bound on the achievable request-weighted average for `plan`.
+
+    Records with no resolvable source seed are excluded: an empty seed
+    pads normally regardless of family (see wmime/formats.py), so they
+    impose no such floor -- only real, already-oversized seeds do.
+
+    Returns a dict: floor_bytes, floor_avg_bytes (the value to compare a
+    requested average against), record_count, total_records,
+    per_family_bytes, per_family_count.
+    """
+    per_family_bytes = {}
+    per_family_count = {}
+    floor_bytes = 0
+    floor_count = 0
+    for r in plan.records:
+        if r.has_source_seed and r.family in HARD_NO_SHRINK_FAMILIES:
+            per_family_bytes[r.family] = per_family_bytes.get(r.family, 0) + r.source_size_bytes
+            per_family_count[r.family] = per_family_count.get(r.family, 0) + 1
+            floor_bytes += r.source_size_bytes
+            floor_count += 1
+    total_records = len(plan.records) or 1
+    return {
+        "floor_bytes": floor_bytes,
+        "floor_avg_bytes": floor_bytes / total_records,
+        "record_count": floor_count,
+        "total_records": total_records,
+        "per_family_bytes": per_family_bytes,
+        "per_family_count": per_family_count,
+    }
+

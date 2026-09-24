@@ -422,16 +422,74 @@ def test_storage_preflight_detects_insufficient_space(baseline, tmp_path, monkey
 
 
 def test_storage_preflight_passes_with_ample_space(baseline, tmp_path, monkeypatch):
-    plan = wg_pool.build_plan(baseline, wg_common.parse_size("100B"), seed=42)
-    out_dir = tmp_path / "workload04-100B"
+    # 10KiB is comfortably above the corpus's format-preserving content-size
+    # floor (~4165B for the real workload04 baseline) so this test still
+    # isolates pure disk-space feasibility, as originally intended.
+    plan = wg_pool.build_plan(baseline, wg_common.parse_size("10KiB"), seed=42)
+    out_dir = tmp_path / "workload04-10KiB"
 
     class HugeUsage:
         total = 10 ** 15
         free = 10 ** 14
 
     monkeypatch.setattr(wg_storage.shutil, "disk_usage", lambda p: HugeUsage())
-    result = wg_storage.run_preflight(plan, tier="100B", requested_avg_text="100B", out_dir=out_dir)
+    result = wg_storage.run_preflight(plan, tier="10KiB", requested_avg_text="10KiB", out_dir=out_dir)
     assert result.feasible
+
+
+def test_content_size_floor_detected_for_tiny_target(baseline, tmp_path, monkeypatch):
+    """A tiny --avg-size (below the corpus's format-preserving content
+    floor) must be reported infeasible for CONTENT reasons even with
+    abundant disk space -- disk-space and content-size feasibility are
+    independent checks."""
+    plan = wg_pool.build_plan(baseline, wg_common.parse_size("0.5KiB"), seed=42)
+    out_dir = tmp_path / "workload04-512B"
+
+    class HugeUsage:
+        total = 10 ** 15
+        free = 10 ** 14
+
+    monkeypatch.setattr(wg_storage.shutil, "disk_usage", lambda p: HugeUsage())
+    result = wg_storage.run_preflight(plan, tier="512B", requested_avg_text="0.5KiB", out_dir=out_dir)
+
+    assert result.feasible_bytes
+    assert not result.feasible_content
+    assert not result.feasible
+    assert result.content_floor_avg_bytes > plan.target_bytes
+    assert result.content_floor_record_count > 0
+    assert "html" in result.content_floor_families
+    assert not out_dir.exists()
+
+
+def test_content_size_floor_is_a_lower_bound(baseline):
+    """The floor is documented/used as a LOWER bound, not an exact-minimum
+    claim: it covers only a subset of records/families."""
+    plan = wg_pool.build_plan(baseline, wg_common.parse_size("0.5KiB"), seed=42)
+    floor = wg_pool.compute_hard_floor(plan)
+    assert 0 < floor["record_count"] < floor["total_records"]
+    assert set(floor["per_family_count"]) <= wg_pool.HARD_NO_SHRINK_FAMILIES
+    assert floor["floor_avg_bytes"] > wg_common.parse_size("0.5KiB")
+
+
+def test_avg_size_below_content_floor_rejected_by_cli(baseline, tmp_path):
+    """--avg-size 0.5KiB must be rejected at preflight for Workload04,
+    before any staging directory or payload file is created."""
+    import workload04_generator as cli
+    out_root = tmp_path / "tiny_content_root"
+    try:
+        rc = cli.main(["--avg-size", "0.5KiB", "--output-root", str(out_root)])
+        assert rc != 0
+        assert not (out_root / "workload04-512B").exists()
+        assert not list(out_root.glob(".workload04-512B.staging.*"))
+    finally:
+        wg_common.set_generated_root(None)
+
+
+def test_plateau_detection_helper():
+    import workload04_generator as cli
+    assert cli._size_convergence_plateaued(1000.0, None) is False
+    assert cli._size_convergence_plateaued(1000.0, 1000.5) is True
+    assert cli._size_convergence_plateaued(1000.0, 2000.0) is False
 
 
 def test_dry_run_creates_no_files(baseline, tmp_path):

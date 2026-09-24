@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -224,6 +225,21 @@ def cmd_init_baseline(argv) -> int:
     return 0
 
 
+def _size_convergence_plateaued(actual_avg: float, prev_avg: Optional[float], epsilon: float = 0.01) -> bool:
+    """True if `actual_avg` barely changed from `prev_avg` (relative change
+    below `epsilon`) -- signals the retry loop's uniform rescale can no
+    longer make progress, almost always because a subset of records are
+    pinned at their real source size by a format that refuses to shrink
+    below it (see wg_pool.HARD_NO_SHRINK_FAMILIES). This is a secondary
+    convergence safeguard only -- it does not replace the pre-flight
+    content-size feasibility check, which already refuses to start
+    generation at all for a provably-impossible target. Returns False on
+    the first iteration (prev_avg is None)."""
+    if prev_avg is None or prev_avg <= 0:
+        return False
+    return abs(actual_avg - prev_avg) / prev_avg < epsilon
+
+
 def cmd_generate(argv) -> int:
     p = argparse.ArgumentParser(prog="workload04_generator.py")
     p.add_argument("--avg-size", required=True,
@@ -344,6 +360,7 @@ def cmd_generate(argv) -> int:
                 result = None
                 size_tolerance = wg_common.DEFAULT_SIZE_TOLERANCE_PCT
                 max_iterations = 6
+                prev_actual_avg = None
                 for iteration in range(1, max_iterations + 1):
                     result = wg_generate.generate_workload(
                         baseline, plan, tier=tier, seed=args.seed, verbose=args.verbose,
@@ -358,6 +375,18 @@ def cmd_generate(argv) -> int:
                               f"target={wg_common.human_size(target_bytes)} error={error * 100:+.2f}%")
                     if error <= size_tolerance or actual_avg <= 0:
                         break
+                    if _size_convergence_plateaued(actual_avg, prev_actual_avg):
+                        print(
+                            f"[WARN] Size convergence plateaued at iteration {iteration} (actual "
+                            f"average barely changed from the previous iteration) -- likely caused "
+                            f"by records in formats that cannot shrink below their real source size "
+                            f"(see wg_pool.HARD_NO_SHRINK_FAMILIES / the pre-flight content-size "
+                            f"note). Stopping retries early instead of continuing to shrink the "
+                            f"remaining already-minimal records toward zero.",
+                            file=sys.stderr,
+                        )
+                        break
+                    prev_actual_avg = actual_avg
                     factor = target_bytes / actual_avg
                     wg_pool.rescale_plan_sizes(plan, factor)
 

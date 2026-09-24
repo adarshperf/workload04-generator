@@ -167,6 +167,10 @@ class PreflightResult:
     inode_check_available: bool
     feasible_bytes: bool
     feasible_inodes: bool
+    feasible_content: bool
+    content_floor_avg_bytes: float
+    content_floor_record_count: int
+    content_floor_families: dict
     max_safe_avg_bytes: Optional[int]
     max_theoretical_avg_bytes: Optional[int]
     label: str = None
@@ -174,7 +178,11 @@ class PreflightResult:
 
     @property
     def feasible(self) -> bool:
-        return self.feasible_bytes and self.feasible_inodes
+        # Disk-space, inode, and content-size feasibility are independent
+        # checks -- a request can pass any two of these and still fail the
+        # third (e.g. plenty of disk space but a content-size floor that
+        # the requested average cannot meet).
+        return self.feasible_bytes and self.feasible_inodes and self.feasible_content
 
 
 def _existing_tier_bytes(out_dir: Path) -> int:
@@ -220,6 +228,14 @@ def run_preflight(plan, *, tier: str, requested_avg_text: str, out_dir: Path,
     if inode_check_available:
         feasible_inodes = fs.available_inodes >= required_inodes
 
+    # Content-size feasibility is INDEPENDENT of disk-space/inode
+    # feasibility: a request can have all the disk space in the world and
+    # still be impossible to honor, because some formats refuse to shrink
+    # below their real source size (see wg_pool.HARD_NO_SHRINK_FAMILIES).
+    from . import pool as wg_pool  # local import: avoid a cycle at module load time
+    floor = wg_pool.compute_hard_floor(plan)
+    feasible_content = plan.target_bytes >= floor["floor_avg_bytes"]
+
     notes = []
     if coexisting:
         notes.append(
@@ -230,6 +246,18 @@ def run_preflight(plan, *, tier: str, requested_avg_text: str, out_dir: Path,
         notes.append(
             "Free-inode count is not available on this platform/filesystem; inode pre-flight was "
             "skipped (byte-capacity pre-flight above is still authoritative)."
+        )
+    if not feasible_content:
+        families = ", ".join(sorted(floor["per_family_count"])) or "none"
+        notes.append(
+            f"Requested average ({wg_common.human_size(plan.target_bytes)}) is below a provable "
+            f"content-size LOWER BOUND of {wg_common.human_size(floor['floor_avg_bytes'])} for this "
+            f"corpus: {floor['record_count']:,} of {floor['total_records']:,} records use formats "
+            f"({families}) that never shrink below their real source size, by design, to avoid "
+            f"producing structurally invalid files (see wmime/formats.py). This is a LOWER BOUND, "
+            f"not necessarily the exact achievable minimum -- other formats' own shrink limits "
+            f"(e.g. jpeg/gif/png re-encoding floors) may raise the true minimum further. Increase "
+            f"--avg-size to at least this lower bound."
         )
 
     max_safe = max_theoretical = None
@@ -246,6 +274,10 @@ def run_preflight(plan, *, tier: str, requested_avg_text: str, out_dir: Path,
         coexisting_old_tier_bytes=coexisting, filesystem=fs,
         required_inodes=required_inodes, inode_check_available=inode_check_available,
         feasible_bytes=feasible_bytes, feasible_inodes=feasible_inodes,
+        feasible_content=feasible_content,
+        content_floor_avg_bytes=floor["floor_avg_bytes"],
+        content_floor_record_count=floor["record_count"],
+        content_floor_families=dict(floor["per_family_count"]),
         max_safe_avg_bytes=max_safe, max_theoretical_avg_bytes=max_theoretical,
         label=label, notes=notes,
     )
@@ -271,6 +303,10 @@ def render_preflight_report(r: PreflightResult) -> str:
     if r.max_safe_avg_bytes is not None:
         L.append(f"Maximum safe avg object size   : {wg_common.human_size(r.max_safe_avg_bytes)}")
         L.append(f"Maximum theoretical avg size   : {wg_common.human_size(r.max_theoretical_avg_bytes)}")
+    if r.content_floor_record_count:
+        L.append(f"Content-size lower bound (fmt) : {wg_common.human_size(r.content_floor_avg_bytes)} "
+                  f"(from {r.content_floor_record_count:,} records: "
+                  f"{', '.join(sorted(r.content_floor_families))})")
     if r.inode_check_available:
         L.append(f"Required inodes (est.)         : {r.required_inodes:,}")
         L.append(f"Available inodes               : {r.filesystem.available_inodes:,}")
@@ -279,14 +315,22 @@ def render_preflight_report(r: PreflightResult) -> str:
     for n in r.notes:
         L.append(f"Note: {n}")
     L.append("=" * 50)
+    L.append(f"Disk-space feasibility         : {'PASS' if r.feasible_bytes else 'FAIL'}")
+    L.append(f"Inode feasibility              : {'PASS' if r.feasible_inodes else 'FAIL'}")
+    L.append(f"Content-size feasibility       : {'PASS' if r.feasible_content else 'FAIL'}")
     if r.feasible:
-        L.append("PASS: sufficient storage")
+        L.append("PASS: sufficient storage and content-size feasibility")
     else:
         reasons = []
         if not r.feasible_bytes:
             reasons.append("insufficient free disk space")
         if not r.feasible_inodes:
             reasons.append("insufficient free inodes")
+        if not r.feasible_content:
+            reasons.append(
+                f"requested average below format-preserving content-size lower bound "
+                f"({wg_common.human_size(r.content_floor_avg_bytes)})"
+            )
         L.append(f"FAIL: {', '.join(reasons)}")
         L.append("Generation aborted before payload creation.")
     return "\n".join(L) + "\n"
