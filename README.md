@@ -315,26 +315,53 @@ cd workload04_generator
 ./install_linux.sh
 ```
 
-The script:
+The script is a true one-shot bootstrap: on a fresh Debian/Ubuntu or
+RHEL/Rocky/Alma/Fedora machine with nothing preinstalled, it detects and
+installs the minimal missing OS packages itself (no manual `apt`/`dnf`
+step required first), then finishes setting up a working environment.
 
 1. verifies the OS is Linux (exits non-zero otherwise);
-2. detects a Python >= 3.8 interpreter;
-3. verifies `venv`/`ensurepip`/pip capability (prints the exact
-   `apt`/`dnf` package to install if missing -- never installs OS packages
-   itself);
-4. creates an isolated `.venv`;
-5. installs `requirements.txt` and `requirements-dev.txt` into it;
-6. verifies `wg`/`wmime` import cleanly;
-7. runs a lightweight `--help` smoke check;
-8. runs the full `self-test` suite if a frozen baseline is already present
-   (otherwise prints how to run `init-baseline` first);
-9. prints a clear `RESULT: PASS`/`RESULT: FAIL` summary;
-10. **exits non-zero on any failure and never silently continues.**
+2. detects the package manager (`apt` for Debian/Ubuntu, `dnf` for
+   RHEL/Rocky/Alma/Fedora -- an unrecognized distro is reported clearly,
+   never guessed);
+3. detects a Python >= 3.8 interpreter and its `venv`/pip capability;
+4. if anything from step 3 is missing, installs ONLY the minimal required
+   OS package(s) (`python3`, `python3-venv`, `python3-pip` as applicable)
+   -- directly if running as root, via `sudo` otherwise; if neither root
+   nor `sudo` is available, or the install command itself fails, it
+   **fails clearly with the exact packages/commands needed and never
+   silently continues**; then re-detects Python and re-verifies before
+   moving on;
+5. creates an isolated `.venv` -- reusing it if already healthy, or
+   **recovering by recreating ONLY `.venv`** (never touching
+   `baselines/`, `reference_workloads/`, generated output, or any other
+   project data) if an existing one is broken/incomplete;
+6. upgrades pip and installs `requirements.txt` (runtime + optional
+   format-fidelity packages) and `requirements-dev.txt` (`pytest`) into
+   it, with a targeted diagnosis (DNS/network/version-mismatch) instead of
+   a bare pip traceback on failure;
+7. verifies `wg`/`wmime` import cleanly;
+8. runs a lightweight `--help` smoke check;
+9. runs `self-test` (baseline-dependent tests self-skip automatically if
+   no frozen baseline is present yet -- this installer never invents or
+   regenerates baseline/golden-corpus data; see
+   [Golden corpus / baseline setup](#quick-start) below for that step);
+10. prints a clear `RESULT: PASS`/`RESULT: FAIL` summary;
+11. **exits non-zero on any failure and never silently continues.**
+
+**Idempotent:** running `./install_linux.sh` again on the same machine is
+safe -- already-installed OS packages, an already-healthy `.venv`, and
+already-installed pip requirements are all detected and reused as-is.
 
 ## Manual installation / recovery if install_linux.sh fails
 
-If `./install_linux.sh` fails on a target machine, install everything by
-hand. Only the packages actually required by this tool are listed below.
+`install_linux.sh` already installs missing OS prerequisites (`python3`,
+`python3-venv`, `python3-pip`) automatically on Debian/Ubuntu (`apt`) and
+RHEL/Rocky/Alma/Fedora (`dnf`) machines, using `sudo` if not already root.
+Manual installation is only needed if: the OS package manager isn't
+`apt`/`dnf`, neither root nor `sudo` is available, or you simply prefer to
+install by hand. Only the packages actually required by this tool are
+listed below.
 
 **Debian/Ubuntu:**
 
@@ -417,17 +444,61 @@ sudo chown -R "$(id -un)":"$(id -gn)" /opt/generated_workload04
 
 ## Quick Start
 
+**A. Fresh Linux machine -- install:**
+
 ```bash
+git clone <repo-url>
 cd workload04_generator
 ./install_linux.sh
+```
+
+**B. Verify the installation:**
+
+```bash
 source .venv/bin/activate
-
-python workload04_generator.py init-baseline \
-  --resource-list /opt/load/workload04-resources.txt \
-  --source-root /opt/workload04
-
 python workload04_generator.py self-test
+```
 
+**C. Register this machine's golden corpus** (external input -- never
+modified by this tool; skip if you're only using the bundled default
+Workload04 corpus):
+
+```bash
+python workload04_generator.py init-baseline \
+  --source-root /opt/workload04 \
+  --resource-list /opt/workload04-resources.txt
+```
+
+**D. Generate a practical first tier.** `10KiB` is a good first target: it
+is comfortably above this corpus's format-preserving content-size lower
+bound (formats like HTML/CSS/JS/PDF/PE/ZIP never shrink below their real
+source size, which puts a hard floor around ~4KiB for the golden
+Workload04 corpus). A target like `512B` is correctly **rejected during
+pre-flight, before any staging/generation**, because it is mathematically
+below that floor for this corpus -- this is expected, documented behavior,
+not a bug (see [Storage pre-flight logic](#storage-pre-flight-logic)).
+
+```bash
+python workload04_generator.py --avg-size 10KiB
+# or, with an explicit workload/output root:
+python workload04_generator.py --avg-size 10KiB \
+  --workload-root /opt/workload04 \
+  --resource-list /opt/workload04-resources.txt \
+  --output-root /opt/generated_workload04
+```
+
+**E. Validate:**
+
+```bash
+python workload04_generator.py validate 10KiB
+python workload04_generator.py audit-size 10KiB
+```
+
+Generated output (under `/opt/generated_workload04/` by default) is
+**never** the golden baseline -- it is disposable, regeneratable content;
+the golden corpus itself is only ever read, never written to.
+
+```bash
 python workload04_generator.py --avg-size 100KiB
 python workload04_generator.py validate 100KiB
 python workload04_generator.py audit-size 100KiB
