@@ -258,14 +258,21 @@ pre-generated and are used read-only.
 ## Reference workloads
 
 `reference_workloads/workload04-100KiB/` and `reference_workloads/workload04-1MiB/`
-are two small, pre-generated, already-validated example tiers bundled with
-this project for quick sanity-checking on a fresh checkout (e.g.
-`validate`/`audit-size` against them right after cloning, before doing any
-real generation of your own). They are ordinary read-only example output --
-not templates the generator reads from, and not affected by
-`--output-root`/`/opt/generated_workload04`. Do not regenerate them
-casually; if you do, use `--force` and re-validate/re-audit afterward. No
-other tier sizes are bundled in this project on purpose (see
+are two small, pre-generated, already-validated example tiers for quick
+sanity-checking on a machine that already has them (e.g. `validate`/
+`audit-size` right after cloning, before doing any real generation of your
+own). They are **local, gitignored, developer-convenience artifacts, not
+tracked in git** (see `.gitignore`) -- a fresh clone will not have this
+directory at all, since the two tiers together are several GiB and are
+never meant to travel with the repository. `tests/test_regression.py::
+test_reference_workloads_integrity` validates them strictly when present,
+and otherwise proves the same deterministic generation mechanism using an
+already-generated real tier, instead of requiring the directory to exist.
+They are ordinary read-only example output -- not templates the generator
+reads from, and not affected by `--output-root`/`/opt/generated_workload04`.
+Do not regenerate them casually; if you do, use `--force` and
+re-validate/re-audit afterward. No other tier sizes are bundled in this
+project on purpose (see
 [Large targets](#large-targets--no-universal-maximum-size)) -- generate
 whatever additional sizes you need under `/opt/generated_workload04`.
 

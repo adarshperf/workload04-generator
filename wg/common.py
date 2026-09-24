@@ -112,6 +112,22 @@ def sanitize_workload_label(raw: str) -> str:
 
 _RESOURCE_LIST_SUFFIX_RE = re.compile(r"[-_]?resources?$", re.IGNORECASE)
 
+_WINDOWS_DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def is_foreign_platform_path(path_str: str) -> bool:
+    """True if `path_str` was recorded as an absolute path on a DIFFERENT
+    platform than the one running now, e.g. a Windows drive-letter path
+    (drive letter, colon, then a path separator) read back on POSIX.
+    Backslashes have no separator meaning on POSIX, so such a string would
+    otherwise be silently misread as one long relative path segment
+    instead of being recognized as simply not applicable here. Used by
+    baseline path resolution to decide when a historical recorded path
+    must not be trusted as-is."""
+    if _WINDOWS_DRIVE_ABS_RE.match(path_str):
+        return os.name != "nt"
+    return False
+
 
 def derive_label_from_resource_list_name(resource_list: Path):
     """Derive a workload label from a conventional ``<label>-resources.txt``

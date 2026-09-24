@@ -266,7 +266,9 @@ class FrozenBaseline:
             )
         self.dir = out_dir
         self.header = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.source_root = Path(self.header["source_root_path"])
+        self._recorded_source_root = Path(self.header["source_root_path"])
+        self._recorded_resource_list = Path(self.header["resource_list_path"])
+        self._resolved_paths = None  # lazy (source_root, resource_list) cache
         self.records = self._load_records(out_dir / self.header["records_file"])
         self.raw_order = (out_dir / self.header["order_file"]).read_text(
             encoding="utf-8", errors="replace"
@@ -304,6 +306,47 @@ class FrozenBaseline:
         Baselines frozen before this field existed default to True --
         that was the only behavior the tool had at the time."""
         return self.header.get("known_invariants_enforced", True)
+
+    def _resolve_paths(self):
+        """Resolve this baseline's source root + resource list on THE
+        CURRENT machine (lazy, cached). The manifest records whatever
+        machine froze it (e.g. a Windows dev checkout) -- that exact path
+        may not exist here (different OS/user/drive), and a foreign
+        absolute path (e.g. a Windows drive letter read back on POSIX)
+        must never be silently misread as a relative path. Resolution
+        order: 1) the recorded paths, if reachable as-is on this machine
+        (same-machine case); 2) otherwise, this machine's own local
+        corpus for this baseline's label (WORKLOAD04_SOURCE_ROOT env var /
+        bundled-zip bootstrap -- see wg/bundled.py), reusing whatever is
+        already there rather than re-extracting. Never rewrites the
+        persisted baseline_manifest.json -- this is purely an in-memory,
+        per-process resolution."""
+        if self._resolved_paths is not None:
+            return self._resolved_paths
+        source_root, resource_list = self._recorded_source_root, self._recorded_resource_list
+        recorded_usable = (
+            not wg_common.is_foreign_platform_path(str(source_root)) and source_root.is_dir()
+            and not wg_common.is_foreign_platform_path(str(resource_list)) and resource_list.is_file()
+        )
+        if not recorded_usable:
+            try:
+                from . import bundled as wg_bundled  # local import: avoid an import cycle
+                source_root, resource_list = wg_bundled.ensure_default_workload_available(self.label)
+            except Exception:
+                source_root, resource_list = self._recorded_source_root, self._recorded_resource_list
+        self._resolved_paths = (source_root, resource_list)
+        return self._resolved_paths
+
+    @property
+    def source_root(self) -> Path:
+        return self._resolve_paths()[0]
+
+    @property
+    def resource_list_path(self) -> Path:
+        """Resolved resource-list path for the CURRENT machine -- may
+        differ from the historical `header['resource_list_path']` recorded
+        at freeze time (see _resolve_paths())."""
+        return self._resolve_paths()[1]
 
     def source_root_reachable(self) -> bool:
         """Whether the ORIGINAL corpus (`source_root_path` recorded at

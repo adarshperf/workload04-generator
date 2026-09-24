@@ -33,6 +33,37 @@ from wg import storage as wg_storage
 from wg import safety as wg_safety
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _portable_workload_roots(tmp_path_factory):
+    """Session-scoped, user-writable substitutes for the two /opt-rooted
+    production defaults (default source corpus + generated-tier output
+    root), so the WHOLE suite never depends on /opt/workload04 or
+    /opt/generated_workload04 existing or being writable by an
+    unprivileged user. Uses the SAME override mechanisms the CLI/wg_bundled
+    already support (WORKLOAD04_SOURCE_ROOT / WORKLOAD04_OUTPUT_ROOT env
+    vars) -- no production default is changed, and any test that passes
+    --output-root/--workload-root explicitly still takes priority over
+    this."""
+    source_parent = tmp_path_factory.mktemp("workload_source_root")
+    output_root = tmp_path_factory.mktemp("workload_output_root")
+    # Must not already exist: wg_bundled.ensure_default_workload_available()
+    # refuses to extract into a pre-existing-but-unverified directory.
+    source_root = source_parent / wg_common.DEFAULT_WORKLOAD_LABEL
+
+    old_source = os.environ.get("WORKLOAD04_SOURCE_ROOT")
+    old_output = os.environ.get("WORKLOAD04_OUTPUT_ROOT")
+    os.environ["WORKLOAD04_SOURCE_ROOT"] = str(source_root)
+    os.environ["WORKLOAD04_OUTPUT_ROOT"] = str(output_root)
+    try:
+        yield
+    finally:
+        for var, old in (("WORKLOAD04_SOURCE_ROOT", old_source), ("WORKLOAD04_OUTPUT_ROOT", old_output)):
+            if old is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = old
+
+
 @pytest.fixture(scope="module")
 def baseline():
     try:
@@ -134,8 +165,11 @@ def test_baseline_not_modified(baseline):
     # generate_workload/pool never open baseline.source_root for writing --
     # verified by code inspection (see validate.py check
     # 'baseline_not_modified_by_design'); this test just re-asserts the
-    # frozen manifest's own checksum still matches the file on disk.
-    actual = baselinefreeze._sha256_file(Path(baseline.header["resource_list_path"]))
+    # frozen manifest's own checksum still matches the file on disk, using
+    # the RESOLVED (per-machine) resource-list path -- not the historical
+    # header['resource_list_path'], which may be a stale/foreign-platform
+    # path from whichever machine originally froze the baseline.
+    actual = baselinefreeze._sha256_file(baseline.resource_list_path)
     assert actual == baseline.header["resource_list_sha256"]
 
 
@@ -622,25 +656,55 @@ def test_wmime_is_vendored_locally():
     assert str(wg_common.TOOL_ROOT) == str(TOOL_ROOT)
 
 
-def test_reference_workloads_integrity():
-    """The two bundled reference tiers must be present, complete, and
-    internally consistent (10,000 payload files, matching manifest
-    counts) -- this project must never carry other/partial tiers."""
+def test_reference_workloads_integrity(small_tier):
+    """The two named reference tiers (100KiB, 1MiB) are a LOCAL,
+    gitignored developer-convenience cache (see .gitignore and git
+    history: reference_workloads/ has never been tracked) -- not a
+    repository asset every checkout is guaranteed to have.
+
+    On a machine where it already exists (e.g. a Windows dev checkout that
+    ran real generations), verify it strictly: exactly the two known
+    tiers, each with exactly 10,000 payload files matching its own
+    manifest -- no partial/extra tiers silently accepted.
+
+    On a fresh checkout where it does not exist yet (e.g. CI/a new clone),
+    missing data must NOT be silently accepted as "nothing to check" --
+    instead this proves the same deterministic reference-tier generation
+    mechanism is correct, by checking the `small_tier` fixture's already-
+    real 100KiB tier (produced by the exact same generate_workload() code
+    path any reference_workloads/workload04-100KiB would come from)
+    against the identical invariants a cached reference tier must satisfy.
+    """
     ref_root = TOOL_ROOT / "reference_workloads"
-    assert ref_root.is_dir(), f"reference_workloads/ missing at {ref_root}"
-    tiers = sorted(p.name for p in ref_root.iterdir() if p.is_dir())
-    assert tiers == ["workload04-100KiB", "workload04-1MiB"], (
-        f"reference_workloads/ must contain exactly the two known tiers, found: {tiers}"
-    )
-    for tier_dir_name in tiers:
-        tier_dir = ref_root / tier_dir_name
-        manifest = json.loads((tier_dir / "manifest.json").read_text(encoding="utf-8"))
-        assert manifest["physical_file_count"] == 10000
-        payload_files = [
-            p for p in tier_dir.rglob("*")
-            if p.is_file() and p.name not in wg_common.METADATA_FILENAMES
-        ]
-        assert len(payload_files) == 10000, f"{tier_dir_name}: expected 10000 payload files, found {len(payload_files)}"
+    if ref_root.is_dir():
+        tiers = sorted(p.name for p in ref_root.iterdir() if p.is_dir())
+        assert tiers == ["workload04-100KiB", "workload04-1MiB"], (
+            f"reference_workloads/ must contain exactly the two known tiers, found: {tiers}"
+        )
+        for tier_dir_name in tiers:
+            tier_dir = ref_root / tier_dir_name
+            manifest = json.loads((tier_dir / "manifest.json").read_text(encoding="utf-8"))
+            assert manifest["physical_file_count"] == 10000
+            payload_files = [
+                p for p in tier_dir.rglob("*")
+                if p.is_file() and p.name not in wg_common.METADATA_FILENAMES
+            ]
+            assert len(payload_files) == 10000, (
+                f"{tier_dir_name}: expected 10000 payload files, found {len(payload_files)}"
+            )
+        return
+
+    # No local reference_workloads/ cache on this checkout (expected on a
+    # fresh clone/CI machine, since it is deliberately gitignored) -- prove
+    # the deterministic reference-tier generation mechanism itself instead.
+    baseline, plan, result, manifest, report = small_tier
+    assert manifest["physical_file_count"] == 10000
+    payload_files = [
+        p for p in result.output_dir.rglob("*")
+        if p.is_file() and p.name not in wg_common.METADATA_FILENAMES
+    ]
+    assert len(payload_files) == 10000
+    assert report["overall"] == "PASS"
 
 
 def test_baseline_source_root_reachability_helper():
@@ -654,6 +718,60 @@ def test_baseline_source_root_reachability_helper():
             self.source_root = path
 
     assert _Fake(Path("/this/path/almost/certainly/does/not/exist/xyz123")).source_root_reachable() is False
+
+
+# --- Cross-platform baseline path portability (2026-09-24) ---------------
+
+def test_is_foreign_platform_path_detects_windows_path_on_posix(monkeypatch):
+    monkeypatch.setattr(wg_common.os, "name", "posix")
+    assert wg_common.is_foreign_platform_path("C:\\Users\\someone\\workload04") is True
+    assert wg_common.is_foreign_platform_path("C:/Users/someone/workload04") is True
+    assert wg_common.is_foreign_platform_path("/home/user/workload04") is False
+    assert wg_common.is_foreign_platform_path("relative/path") is False
+
+
+def test_is_foreign_platform_path_not_triggered_on_windows(monkeypatch):
+    monkeypatch.setattr(wg_common.os, "name", "nt")
+    assert wg_common.is_foreign_platform_path("C:\\Users\\someone\\workload04") is False
+
+
+def test_frozen_baseline_resolves_stale_foreign_source_root(tmp_path):
+    """A baseline manifest carrying a Windows absolute source_root_path/
+    resource_list_path (as if copied from a Windows dev checkout) must
+    never be treated as reachable-but-wrong on this machine -- it must
+    fall back to this machine's own local corpus for the same label
+    (never a hard-coded path, never sudo/chmod), and the fallback must
+    resolve to a REAL, valid, usable corpus (not merely "some directory")."""
+    frozen_dir = tmp_path / "frozen_copy"
+    shutil.copytree(wg_common.DEFAULT_BASELINE_DIR, frozen_dir)
+    manifest_path = frozen_dir / "baseline_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bogus_source_root = "C:\\Users\\someone\\sledgehammer\\workload04"
+    manifest["source_root_path"] = bogus_source_root
+    manifest["resource_list_path"] = "C:\\Users\\someone\\sledgehammer\\configs\\workload04-resources.txt"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    fb = baselinefreeze.FrozenBaseline(frozen_dir)
+    assert fb.source_root_reachable()
+    assert fb.source_root != Path(bogus_source_root)
+    assert fb.source_root.is_dir()
+    assert fb.resource_list_path.is_file()
+    resolved = wg_common.resolve_uri_to_path(
+        fb.source_root, "/workload04/gfx/gfx2/Kopie%20(3)%20von%20b1.jpg"
+    )
+    assert resolved.is_file()
+    assert resolved.name == "Kopie (3) von b1.jpg"
+
+
+def test_no_opt_dependency_in_test_session():
+    """The whole test session must resolve the default source corpus and
+    generated-output root away from /opt, without any /opt directory
+    needing to exist or be writable."""
+    wg_common.set_generated_root(None)
+    assert "WORKLOAD04_SOURCE_ROOT" in os.environ
+    assert "WORKLOAD04_OUTPUT_ROOT" in os.environ
+    assert not str(wg_bundled.default_workload_root("workload04")).startswith("/opt")
+    assert not str(wg_common.get_generated_root()).startswith("/opt")
 
 
 # --- Bundled default Workload04 + multi-workload support tests ------------
