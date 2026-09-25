@@ -8,7 +8,13 @@
 #     required OS packages automatically (root directly, or via sudo for a
 #     non-root user), then re-detects Python. Never installs unrelated
 #     system packages, and never silently continues after a failed OS
-#     package installation.
+#     package installation. Before creating .venv, also runs a REAL
+#     functional probe (not just a static import check) to catch
+#     Debian/Ubuntu's split-package ensurepip failure mode, and -- if
+#     needed -- automatically installs the EXACT interpreter-version
+#     package (e.g. python3.8-venv, python3.10-venv, python3.12-venv;
+#     never hard-coded to one version), falling back to the generic
+#     python3-venv only if that doesn't exist for this distro.
 #  5. Creates an isolated .venv -- recovering (recreating ONLY .venv, never
 #     touching project data) if an existing one is broken/incomplete.
 #  6. Upgrades pip, installs requirements.txt (runtime + optional
@@ -74,11 +80,29 @@ have_sudo() {
 # Minimal OS package providing `concept` (python|venv|pip) for package
 # manager `pm` (apt|dnf). Empty output means "nothing to install" (e.g.
 # venv support ships inside the `python3` package itself on RHEL-family).
+#
+# For apt:venv, pass the selected python binary as $3 to get the EXACT
+# interpreter-version package (e.g. "python3.8-venv", "python3.10-venv",
+# "python3.12-venv") -- Debian/Ubuntu split ensurepip's bootstrap wheels
+# into a per-version package, and installing the wrong version's package
+# does not fix another version's interpreter. Omitting $3 (or if the
+# version can't be determined) falls back to the generic "python3-venv".
 os_package_for_concept() {
-    pm="$1"; concept="$2"
+    pm="$1"; concept="$2"; py="${3:-}"
     case "${pm}:${concept}" in
         apt:python) echo "python3" ;;
-        apt:venv)   echo "python3-venv" ;;
+        apt:venv)
+            if [ -n "$py" ]; then
+                exact="$(apt_venv_package_name "$py")"
+                if [ -n "$exact" ]; then
+                    echo "$exact"
+                else
+                    echo "python3-venv"
+                fi
+            else
+                echo "python3-venv"
+            fi
+            ;;
         apt:pip)    echo "python3-pip" ;;
         dnf:python) echo "python3" ;;
         dnf:venv)   echo "" ;;
@@ -124,6 +148,76 @@ python_missing_concepts() {
 venv_is_healthy() {
     # $1 = venv directory. Healthy = has a working python with a working pip.
     [ -x "$1/bin/python" ] && "$1/bin/python" -m pip --version >/dev/null 2>&1
+}
+
+python_major_minor() {
+    # $1 = python binary. Prints "3.8", "3.10", "3.12", etc.
+    "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null
+}
+
+apt_venv_package_name() {
+    # $1 = python binary. Prints the EXACT-version Debian/Ubuntu venv
+    # package for this interpreter (e.g. "python3.8-venv"), never a
+    # hard-coded version. Prints nothing if the version can't be determined.
+    ver="$(python_major_minor "$1")"
+    if [ -n "$ver" ]; then
+        echo "python${ver}-venv"
+    fi
+}
+
+venv_probe_works() {
+    # $1 = python binary. Attempts a REAL, disposable venv creation to
+    # detect Debian/Ubuntu's split-package ensurepip failure mode: `import
+    # venv` and `import ensurepip` can both succeed while actual venv
+    # creation still fails ("ensurepip is not available") unless the exact
+    # pythonX.Y-venv package is installed -- a static import check cannot
+    # see this; only actually trying to create a venv can. The probe venv
+    # is created under a throwaway temp directory and always removed.
+    py="$1"
+    probe_dir="$(mktemp -d 2>/dev/null)" || probe_dir="/tmp/wg_venv_probe.$$"
+    mkdir -p "$probe_dir" 2>/dev/null
+    result=1
+    if "$py" -m venv "$probe_dir/probe" >/dev/null 2>&1 && [ -x "$probe_dir/probe/bin/python" ]; then
+        result=0
+    fi
+    rm -rf -- "$probe_dir"
+    return $result
+}
+
+# Ensures `py` can create a working venv, automatically installing the
+# exact interpreter-version OS package if it currently cannot (preferring
+# pythonX.Y-venv over the generic python3-venv on Debian/Ubuntu; falling
+# back to the generic package only if the exact-version one doesn't fix
+# it). Returns: 0 = working (already, or after installing a package), 1 =
+# automatic installation was attempted and venv still doesn't work, 2 = no
+# automatic installation was possible (unknown package manager, or neither
+# root nor sudo available).
+ensure_venv_capability() {
+    py="$1"; pm="$2"
+    if venv_probe_works "$py"; then
+        return 0
+    fi
+    if [ "$pm" = "none" ]; then
+        return 2
+    fi
+    primary_pkg="$(os_package_for_concept "$pm" venv "$py")"
+    fallback_pkg="$(os_package_for_concept "$pm" venv)"
+    [ -z "$fallback_pkg" ] && fallback_pkg="python3-venv"
+    candidates="$primary_pkg"
+    if [ -n "$fallback_pkg" ] && [ "$fallback_pkg" != "$primary_pkg" ]; then
+        candidates="$candidates $fallback_pkg"
+    fi
+    for pkg in $candidates; do
+        install_os_packages "$pm" "$pkg"
+        rc=$?
+        if [ "$rc" = "2" ]; then
+            return 2
+        fi
+        if venv_probe_works "$py"; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 diagnose_pip_failure() {
@@ -254,7 +348,11 @@ fi
 if [ -n "$MISSING_CONCEPTS" ]; then
     NEEDED_PKGS=""
     for concept in $MISSING_CONCEPTS; do
-        pkg="$(os_package_for_concept "$PKG_MGR" "$concept")"
+        if [ "$concept" = "venv" ]; then
+            pkg="$(os_package_for_concept "$PKG_MGR" "$concept" "$PYTHON_BIN")"
+        else
+            pkg="$(os_package_for_concept "$PKG_MGR" "$concept")"
+        fi
         [ -n "$pkg" ] && NEEDED_PKGS="$NEEDED_PKGS $pkg"
     done
     NEEDED_PKGS="$(printf '%s' "$NEEDED_PKGS" | sed -e 's/^ *//')"
@@ -327,6 +425,31 @@ if [ -d "$VENV_DIR" ] && ! venv_is_healthy "$VENV_DIR"; then
     fi
 fi
 if [ ! -d "$VENV_DIR" ]; then
+    if ! venv_probe_works "$PYTHON_BIN"; then
+        warn "$PYTHON_BIN cannot create a working virtual environment yet (ensurepip unavailable)."
+        candidate_pkg="$(os_package_for_concept "$PKG_MGR" venv "$PYTHON_BIN")"
+        [ -z "$candidate_pkg" ] && candidate_pkg="python3-venv"
+        warn "Attempting automatic installation of: $candidate_pkg"
+        ensure_venv_capability "$PYTHON_BIN" "$PKG_MGR"
+        rc=$?
+        case "$rc" in
+            0) ok "Virtual environment capability confirmed after installing the required OS package." ;;
+            2)
+                err "Neither running as root nor sudo is available -- cannot install venv support automatically."
+                printf '\nInstall the following manually, then re-run this script:\n'
+                manual_install_hint "$PKG_MGR" "$candidate_pkg"
+                printf '\nRESULT: FAIL\n'
+                exit 1
+                ;;
+            *)
+                err "Automatic installation of venv support failed (see /tmp/wg_os_packages.log)."
+                printf '\nInstall the following manually, then re-run this script:\n'
+                manual_install_hint "$PKG_MGR" "$candidate_pkg"
+                printf '\nRESULT: FAIL\n'
+                exit 1
+                ;;
+        esac
+    fi
     if ! "$PYTHON_BIN" -m venv "$VENV_DIR"; then
         err "Failed to create virtual environment at $VENV_DIR."
         printf '\nRESULT: FAIL\n'

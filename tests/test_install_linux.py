@@ -290,3 +290,181 @@ def test_install_os_packages_noop_for_empty_package_list():
     result = _run_bash('install_os_packages apt; echo "RC=$?"')
     assert result.returncode == 0, result.stderr
     assert "RC=0" in result.stdout
+
+
+# --- version-specific venv package detection (regression: a real fresh
+# Debian/Ubuntu machine with Python 3.8.10 but no python3.8-venv failed
+# with "ensurepip is not available" because the old logic only checked
+# `import venv`/`import ensurepip`, which both succeed on Debian even when
+# actual venv creation is broken) -------------------------------------------
+
+def test_python_major_minor_matches_actual_interpreter():
+    py = Path(sys.executable).as_posix()
+    expected = f"{sys.version_info.major}.{sys.version_info.minor}"
+    result = _run_bash(f'python_major_minor "{py}"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+def test_apt_venv_package_name_is_version_specific_not_hardcoded():
+    """Must derive the package name FROM the interpreter's actual version
+    -- never hard-code e.g. python3.10-venv for a 3.8 or 3.12 interpreter."""
+    py = Path(sys.executable).as_posix()
+    major, minor = sys.version_info.major, sys.version_info.minor
+    result = _run_bash(f'apt_venv_package_name "{py}"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"python{major}.{minor}-venv"
+    # A fabricated 3.8 interpreter reference must NOT collide with this
+    # machine's own (different) version -- proves the mapping is dynamic.
+    if (major, minor) != (3, 8):
+        assert result.stdout.strip() != "python3.8-venv"
+
+
+def test_os_package_for_concept_apt_venv_prefers_exact_version_over_generic():
+    py = Path(sys.executable).as_posix()
+    major, minor = sys.version_info.major, sys.version_info.minor
+    with_py = _run_bash(f'os_package_for_concept apt venv "{py}"')
+    without_py = _run_bash("os_package_for_concept apt venv")
+    assert with_py.returncode == 0, with_py.stderr
+    assert without_py.returncode == 0, without_py.stderr
+    assert with_py.stdout.strip() == f"python{major}.{minor}-venv"
+    assert without_py.stdout.strip() == "python3-venv"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="python -m venv lays out Scripts/ on Windows, not the POSIX bin/ "
+           "layout this Linux-only installer's venv_probe_works() checks for",
+)
+def test_venv_probe_works_true_for_real_interpreter():
+    """This machine's own interpreter (running pytest right now) must be
+    able to create a real, working venv -- proving the probe isn't a
+    false negative on a healthy system."""
+    py = Path(sys.executable).as_posix()
+    result = _run_bash(f'venv_probe_works "{py}" && echo YES || echo NO')
+    assert result.returncode == 0, result.stderr
+    assert "YES" in result.stdout
+
+
+def test_venv_probe_works_false_for_nonexistent_interpreter():
+    result = _run_bash('venv_probe_works "/no/such/python/binary" && echo YES || echo NO')
+    assert result.returncode == 0, result.stderr
+    assert "NO" in result.stdout
+
+
+def _stubbed_env(probe_sequence, install_calls_file):
+    """Bash snippet that overrides venv_probe_works to return the given
+    sequence of exit codes (one per call, last value repeats after
+    exhausted) and overrides install_os_packages to record each requested
+    package to `install_calls_file` and succeed -- used to test
+    ensure_venv_capability's orchestration without touching real OS
+    packages or requiring root/sudo."""
+    seq = " ".join(str(c) for c in probe_sequence)
+    return f'''
+_probe_seq=({seq})
+_probe_i=0
+venv_probe_works() {{
+    idx=$_probe_i
+    if [ "$idx" -ge "${{#_probe_seq[@]}}" ]; then
+        idx=$(( ${{#_probe_seq[@]}} - 1 ))
+    fi
+    _probe_i=$(( _probe_i + 1 ))
+    return "${{_probe_seq[$idx]}}"
+}}
+install_os_packages() {{
+    pm="$1"; shift
+    echo "$*" >> "{install_calls_file}"
+    return 0
+}}
+'''
+
+
+def test_ensure_venv_capability_noop_when_already_working(tmp_path):
+    """Idempotent / healthy-case: if venv already works, install_os_packages
+    must never be called at all."""
+    calls_file = (tmp_path / "calls.txt").as_posix()
+    body = _stubbed_env([0], calls_file) + f'\nensure_venv_capability "fakepython" apt; echo "RC=$?"'
+    result = _run_bash(body)
+    assert result.returncode == 0, result.stderr
+    assert "RC=0" in result.stdout
+    assert not Path(calls_file).exists(), "a working interpreter must never trigger a package install"
+
+
+def test_ensure_venv_capability_installs_exact_version_package_and_recovers(tmp_path):
+    """Missing ensurepip/venv recovery path: probe fails once, the EXACT
+    interpreter-version package gets installed, then the probe succeeds --
+    exactly the fresh-Debian-machine scenario from the bug report."""
+    calls_file = (tmp_path / "calls.txt").as_posix()
+    py = Path(sys.executable).as_posix()
+    body = _stubbed_env([1, 0], calls_file) + f'\nensure_venv_capability "{py}" apt; echo "RC=$?"'
+    result = _run_bash(body)
+    assert result.returncode == 0, result.stderr
+    assert "RC=0" in result.stdout
+    major, minor = sys.version_info.major, sys.version_info.minor
+    calls = Path(calls_file).read_text(encoding="utf-8").strip()
+    assert calls == f"python{major}.{minor}-venv", (
+        "must install the EXACT interpreter-version package first, not the generic one"
+    )
+
+
+def test_ensure_venv_capability_falls_back_to_generic_package(tmp_path):
+    """If the exact-version package install doesn't fix it, the generic
+    python3-venv package must be tried as a second, automatic attempt."""
+    calls_file = (tmp_path / "calls.txt").as_posix()
+    py = Path(sys.executable).as_posix()
+    body = _stubbed_env([1, 1, 0], calls_file) + f'\nensure_venv_capability "{py}" apt; echo "RC=$?"'
+    result = _run_bash(body)
+    assert result.returncode == 0, result.stderr
+    assert "RC=0" in result.stdout
+    major, minor = sys.version_info.major, sys.version_info.minor
+    calls = Path(calls_file).read_text(encoding="utf-8").splitlines()
+    assert calls == [f"python{major}.{minor}-venv", "python3-venv"]
+
+
+def test_ensure_venv_capability_fails_clearly_when_still_broken(tmp_path):
+    """If venv still doesn't work after trying both the exact-version and
+    generic packages, ensure_venv_capability must report failure (1), not
+    silently claim success."""
+    calls_file = (tmp_path / "calls.txt").as_posix()
+    py = Path(sys.executable).as_posix()
+    body = _stubbed_env([1, 1, 1], calls_file) + f'\nensure_venv_capability "{py}" apt; echo "RC=$?"'
+    result = _run_bash(body)
+    assert result.returncode == 0, result.stderr
+    assert "RC=1" in result.stdout
+
+
+def test_ensure_venv_capability_returns_2_when_no_root_or_sudo(tmp_path):
+    """When automatic package installation is impossible (no root/sudo),
+    ensure_venv_capability must report that distinctly (2) so the caller
+    can fail with the exact manual command, never attempting a fallback
+    that would also be impossible."""
+    py = Path(sys.executable).as_posix()
+    body = f'''
+venv_probe_works() {{ return 1; }}
+install_os_packages() {{ return 2; }}
+ensure_venv_capability "{py}" apt; echo "RC=$?"
+'''
+    result = _run_bash(body)
+    assert result.returncode == 0, result.stderr
+    assert "RC=2" in result.stdout
+
+
+def test_ensure_venv_capability_returns_2_for_unknown_package_manager():
+    py = Path(sys.executable).as_posix()
+    result = _run_bash(f'venv_probe_works() {{ return 1; }}\nensure_venv_capability "{py}" none; echo "RC=$?"')
+    assert result.returncode == 0, result.stderr
+    assert "RC=2" in result.stdout
+
+
+def test_existing_installer_behavior_intact_for_apt_pip_and_python():
+    """Non-venv concept mappings must be completely unaffected by the
+    version-specific venv change."""
+    result = _run_bash(
+        "os_package_for_concept apt python; "
+        "os_package_for_concept apt pip; "
+        "os_package_for_concept dnf python; "
+        "os_package_for_concept dnf pip"
+    )
+    assert result.returncode == 0, result.stderr
+    lines = [ln for ln in result.stdout.splitlines() if ln != ""]
+    assert lines == ["python3", "python3-pip", "python3", "python3-pip"]
