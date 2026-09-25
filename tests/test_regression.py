@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import random
 import shutil
 import sys
 import time
@@ -31,6 +32,7 @@ from wg import pathnorm
 from wg import reportio
 from wg import storage as wg_storage
 from wg import safety as wg_safety
+from wmime import common as wmime_common
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -772,6 +774,93 @@ def test_no_opt_dependency_in_test_session():
     assert "WORKLOAD04_OUTPUT_ROOT" in os.environ
     assert not str(wg_bundled.default_workload_root("workload04")).startswith("/opt")
     assert not str(wg_common.get_generated_root()).startswith("/opt")
+
+
+# --- Python 3.8 compatibility: random.Random.randbytes() was added in 3.9;
+# make_filler_text()/make_filler_bytes() must keep working (deterministically,
+# byte-for-byte matching randbytes()'s documented semantics) on 3.8+ ---------
+
+def test_randbytes_compat_matches_real_randbytes_for_same_seed():
+    """_randbytes_compat() must be byte-for-byte identical to the real
+    random.Random.randbytes() for the same seed -- this is the actual
+    compatibility contract, not just \"produces some bytes\"."""
+    seed = 20260925
+    r_compat = random.Random(seed)
+    r_real = random.Random(seed)
+    assert wmime_common._randbytes_compat(r_compat, 4096) == r_real.randbytes(4096)
+
+
+def test_randbytes_dispatches_to_real_randbytes_when_available():
+    seed = 7
+    r_dispatch = random.Random(seed)
+    r_real = random.Random(seed)
+    assert wmime_common._randbytes(r_dispatch, 256) == r_real.randbytes(256)
+
+
+def test_randbytes_fallback_used_when_randbytes_attribute_missing():
+    """Simulates Python 3.8 (no random.Random.randbytes) via a getrandbits-
+    only stand-in, and proves the fallback path is actually taken (not
+    silently skipped) and produces output identical to the real
+    randbytes() for the same seed."""
+    seed = 4242
+
+    class _NoRandbytes:
+        def __init__(self, seed):
+            self._inner = random.Random(seed)
+
+        def getrandbits(self, k):
+            return self._inner.getrandbits(k)
+
+    fake_rng = _NoRandbytes(seed)
+    assert not hasattr(fake_rng, "randbytes")
+    expected = random.Random(seed).randbytes(1024)
+    assert wmime_common._randbytes(fake_rng, 1024) == expected
+
+
+def test_make_filler_bytes_works_without_randbytes_on_py38_style_rng():
+    """End-to-end: make_filler_bytes() itself (not just the private helper)
+    must work and stay deterministic when randbytes() is unavailable,
+    matching the real 3.9+ output for the same seed."""
+    seed = 99
+
+    class _NoRandbytes:
+        def __init__(self, seed):
+            self._inner = random.Random(seed)
+
+        def getrandbits(self, k):
+            return self._inner.getrandbits(k)
+
+    fake_rng = _NoRandbytes(seed)
+    result = wmime_common.make_filler_bytes(fake_rng, 2048)
+    expected = wmime_common.make_filler_bytes(random.Random(seed), 2048)
+    assert result == expected
+    assert len(result) == 2048
+
+
+def test_make_filler_bytes_deterministic_with_same_seed():
+    a = wmime_common.make_filler_bytes(random.Random(1234), 3000)
+    b = wmime_common.make_filler_bytes(random.Random(1234), 3000)
+    assert a == b
+    assert len(a) == 3000
+
+
+def test_make_filler_text_works_without_randbytes_on_py38_style_rng():
+    """make_filler_text() also calls the shared _randbytes() helper --
+    must be equally Python-3.8-safe and deterministic."""
+    seed = 555
+
+    class _NoRandbytes:
+        def __init__(self, seed):
+            self._inner = random.Random(seed)
+
+        def getrandbits(self, k):
+            return self._inner.getrandbits(k)
+
+    fake_rng = _NoRandbytes(seed)
+    result = wmime_common.make_filler_text(fake_rng, 500)
+    expected = wmime_common.make_filler_text(random.Random(seed), 500)
+    assert result == expected
+    assert len(result) == 500
 
 
 # --- Bundled default Workload04 + multi-workload support tests ------------

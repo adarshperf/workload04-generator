@@ -169,11 +169,17 @@ def test_venv_is_healthy_true_for_real_venv(tmp_path):
     venv_is_healthy() checks for; using bash (rather than this test
     process's own `venv` module, whose directory layout is OS-native and
     would be Scripts/python.exe on Windows) keeps the test meaningful
-    cross-platform."""
+    cross-platform. The symlink target is THIS test process's own
+    interpreter (sys.executable), not a bare 'python'/'python3' PATH
+    lookup -- a fresh machine's system python may have no pip installed
+    at all (that's exactly the class of bug this installer exists to work
+    around), so only sys.executable is guaranteed to satisfy
+    venv_is_healthy()'s real contract (a working `-m pip --version`)."""
     venv_dir = tmp_path / ".venv"
+    py = Path(sys.executable).as_posix()
     result = _run_bash(
         f'mkdir -p "{venv_dir.as_posix()}/bin"; '
-        f'ln -sf "$(command -v python || command -v python3)" "{venv_dir.as_posix()}/bin/python"; '
+        f'ln -sf "{py}" "{venv_dir.as_posix()}/bin/python"; '
         f'venv_is_healthy "{venv_dir.as_posix()}" && echo YES || echo NO'
     )
     assert result.returncode == 0, result.stderr
@@ -215,12 +221,14 @@ def test_recover_broken_venv_refuses_unexpected_path(tmp_path):
 def test_recover_broken_venv_is_idempotent_noop_when_healthy(tmp_path):
     """Running recovery against an already-healthy venv must be a no-op
     (idempotent second run). Uses the same bash-built POSIX-layout venv as
-    test_venv_is_healthy_true_for_real_venv, for the same cross-platform
-    reason."""
+    test_venv_is_healthy_true_for_real_venv (symlinked to sys.executable,
+    guaranteed to have working pip), for the same cross-platform/real-
+    machine reason."""
     venv_dir = tmp_path / ".venv"
+    py = Path(sys.executable).as_posix()
     result = _run_bash(
         f'mkdir -p "{venv_dir.as_posix()}/bin"; '
-        f'ln -sf "$(command -v python || command -v python3)" "{venv_dir.as_posix()}/bin/python"; '
+        f'ln -sf "{py}" "{venv_dir.as_posix()}/bin/python"; '
         f'recover_broken_venv "{venv_dir.as_posix()}"; echo "RC=$?"'
     )
     assert result.returncode == 0, result.stderr

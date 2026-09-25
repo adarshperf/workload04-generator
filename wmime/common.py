@@ -238,10 +238,28 @@ _FILLER_ALPHABET_BYTES = _FILLER_ALPHABET.encode("ascii")
 _FILLER_TRANSLATE_TABLE = bytes(_FILLER_ALPHABET_BYTES[b % len(_FILLER_ALPHABET_BYTES)] for b in range(256))
 
 
+def _randbytes_compat(rng: random.Random, n: int) -> bytes:
+    """Python 3.8 fallback for random.Random.randbytes() (added in 3.9).
+    Reproduces its documented, exact semantics -- getrandbits(n*8) packed
+    little-endian -- so output is byte-for-byte identical to the real
+    randbytes() for the same rng state/seed, preserving deterministic,
+    reproducible generation across Python versions (3.9+ still uses the
+    faster C-accelerated randbytes() via the branch below; only 3.8 pays
+    the pure-Python cost)."""
+    return rng.getrandbits(n * 8).to_bytes(n, "little")
+
+
+def _randbytes(rng: random.Random, n: int) -> bytes:
+    randbytes = getattr(rng, "randbytes", None)
+    if randbytes is not None:
+        return randbytes(n)
+    return _randbytes_compat(rng, n)
+
+
 def make_filler_text(rng: random.Random, length: int, line_width: int = 96) -> bytes:
     if length <= 0:
         return b""
-    body = rng.randbytes(length).translate(_FILLER_TRANSLATE_TABLE)
+    body = _randbytes(rng, length).translate(_FILLER_TRANSLATE_TABLE)
     if line_width > 0 and length > line_width:
         body = b"\n".join(body[i:i + line_width] for i in range(0, len(body), line_width + 1))
     if len(body) > length:
@@ -255,9 +273,11 @@ def make_filler_bytes(rng: random.Random, length: int) -> bytes:
     """Arbitrary binary filler (safe inside length-prefixed containers)."""
     if length <= 0:
         return b""
-    # random.Random.randbytes() is implemented in C and is orders of magnitude
-    # faster than a per-byte Python loop for multi-MB payloads.
-    return rng.randbytes(length)
+    # random.Random.randbytes() (Python 3.9+) is implemented in C and is
+    # orders of magnitude faster than a per-byte Python loop for multi-MB
+    # payloads; _randbytes() falls back to an exact-semantics pure-Python
+    # equivalent on 3.8, where randbytes() does not exist.
+    return _randbytes(rng, length)
 
 
 # --- Tolerances / defaults (master task sections 7, 10, 15, 16) ---------
