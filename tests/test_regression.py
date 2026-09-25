@@ -781,20 +781,38 @@ def test_no_opt_dependency_in_test_session():
 # byte-for-byte matching randbytes()'s documented semantics) on 3.8+ ---------
 
 def test_randbytes_compat_matches_real_randbytes_for_same_seed():
-    """_randbytes_compat() must be byte-for-byte identical to the real
-    random.Random.randbytes() for the same seed -- this is the actual
-    compatibility contract, not just \"produces some bytes\"."""
+    """_randbytes_compat() must be byte-for-byte identical to CPython's
+    documented random.Random.randbytes() semantics (getrandbits(n*8) packed
+    little-endian) for the same seed. The expected value is computed here
+    independently rather than via the real randbytes() method, which does
+    not exist on Python 3.8 -- this test must itself run on 3.8."""
     seed = 20260925
+    n = 4096
     r_compat = random.Random(seed)
-    r_real = random.Random(seed)
-    assert wmime_common._randbytes_compat(r_compat, 4096) == r_real.randbytes(4096)
+    r_expected = random.Random(seed)
+    expected = r_expected.getrandbits(n * 8).to_bytes(n, "little")
+    assert wmime_common._randbytes_compat(r_compat, n) == expected
 
 
 def test_randbytes_dispatches_to_real_randbytes_when_available():
-    seed = 7
-    r_dispatch = random.Random(seed)
-    r_real = random.Random(seed)
-    assert wmime_common._randbytes(r_dispatch, 256) == r_real.randbytes(256)
+    """When rng exposes a randbytes attribute, _randbytes() must dispatch to
+    it rather than falling back to _randbytes_compat(). Uses a fake stand-in
+    (the real stdlib randbytes is unavailable on Python 3.8) that records
+    calls and raises if the fallback path is touched."""
+    calls = []
+
+    class _FakeRandbytesRng:
+        def randbytes(self, n):
+            calls.append(n)
+            return b"\xab" * n
+
+        def getrandbits(self, k):
+            raise AssertionError("fallback path must not be used when randbytes exists")
+
+    fake_rng = _FakeRandbytesRng()
+    result = wmime_common._randbytes(fake_rng, 256)
+    assert result == b"\xab" * 256
+    assert calls == [256]
 
 
 def test_randbytes_fallback_used_when_randbytes_attribute_missing():
@@ -813,8 +831,9 @@ def test_randbytes_fallback_used_when_randbytes_attribute_missing():
 
     fake_rng = _NoRandbytes(seed)
     assert not hasattr(fake_rng, "randbytes")
-    expected = random.Random(seed).randbytes(1024)
-    assert wmime_common._randbytes(fake_rng, 1024) == expected
+    n = 1024
+    expected = random.Random(seed).getrandbits(n * 8).to_bytes(n, "little")
+    assert wmime_common._randbytes(fake_rng, n) == expected
 
 
 def test_make_filler_bytes_works_without_randbytes_on_py38_style_rng():
